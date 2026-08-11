@@ -1,0 +1,17 @@
+# Pinned around signatory 1.2.6.1.9.0, which compiles against torch 1.9.0 only.
+# env/create_env.sh installs these in the order that actually works and explains
+# each pin; plain `pip install -r` will NOT reproduce the environment, because
+# signatory needs torch importable before it builds.
+torch==1.9.0+cpu           # -f https://download.pytorch.org/whl/torch_stable.html
+signatory==1.2.6.1.9.0     # --no-build-isolation, after torch
+pytorch-lightning==1.6.5
+torchmetrics==0.9.3
+numpy<2
+pandas<2.1
+pyarrow
+protobuf<4
+pyyaml
+scipy
+tqdm
+pytest
+setuptools==59.5.0
