@@ -1,1 +1,107 @@
+# GSM-Alpha, the report's own setting (section 3.1).
+#
+#   augmentation : coordinate projection with pairs, then time, then basepoint
+#   window       : global
+#   transform    : log-signature, depth 5
+#   rescaling    : none
+#
+# Every path below is the only thing a different deployment has to change; the
+# data contract those two files must satisfy is documented in README.md.
 
+data:
+  daily_path: /tq/scratch/zhangchang/data/cn_equity/pv/daily_ohlcv_20160101_20251231.parquet
+  intraday_path: /tq/scratch/zhangchang/data/cn_equity/pv/intraday/rq_5m_ohlcv_20160101_20251231.parquet
+  cache_dir: /tq/scratch/zhangchang/data/gsm_alpha/cache
+
+  start_date: "2014-01-01"     # clamped to whatever history the panels actually hold
+  end_date: "2025-12-31"
+
+  minute_lookback_days: 20     # section 3.2: 20 days of 5-minute bars
+  daily_lookback_days: 60      # section 3.2: 60 days of dailies
+
+  # The label is a 20-day forward return, so consecutive daily samples overlap
+  # by 19/20 and carry very little independent information. Striding the
+  # training set cuts cost almost for free; set to 1 to reproduce the report.
+  train_day_stride: 5
+  predict_day_stride: 1
+
+  # Liquidity screen. The report uses the whole market; a top-N screen keeps the
+  # cache to a sane size on a first run. null = keep everything.
+  universe_top_n: 1500
+  universe_lookback_days: 60
+
+  min_valid_fraction: 0.5
+  price_zscore: joint          # see gsm_alpha/data/preprocess.py for why
+
+  use_minute_branch: true      # both branches on  = GSM-Alpha
+  use_daily_branch: true       # minute branch only = GSM-Alpha-min (table 10)
+
+# GSM settings per branch. Table 2 picks time+basepoint, table 3 picks the
+# 2-dimensional coordinate projection over the learnable alternatives, table 4
+# prefers dyadic windows in general (the report still chooses global here, "在
+# 窗口设定上我们选择了简单的设定"), table 6 puts depth 4-5 at the optimum and
+# table 7 finds no rescaling best.
+minute_gsm: &gsm
+  depth: 5
+  augmentations: [coordinate_projection, time, basepoint]
+  transform: logsignature
+  window: global
+  rescaling: none
+  projection_size: 2           # pairs; 1 = singletons, 3 = triplets
+  projection_ordered: false    # C(d,2)=10 streams for 5 OHLCV channels
+  backend: auto                # signatory when importable, pure torch otherwise
+
+daily_gsm: *gsm
+
+model:
+  hidden_dim: 128
+  n_attention_heads: 4
+  attention_dropout: 0.1
+  use_stock_mixing: true       # false reproduces the table 9 ablation
+  learning_rate: 0.001
+  weight_decay: 0.00001
+  loss_halflife_fraction: 0.5  # section 3.2: half-life = batch size / 2
+
+labels:
+  horizon: 20
+
+  # Best option: a precomputed, already forward-shifted residual return. Export
+  # one from the tq zoo with scripts/export_labels.py, which also prints the two
+  # lines below filled in. Nothing is shifted or neutralised again downstream.
+  #
+  #   forward_label_path: /data/gsm/labels_res20d.parquet
+  #   forward_label_column: resp_res_rq_cnltb_1500to1500_20d
+  #   forward_label_scale: 0.0001      # the zoo series is in basis points
+  #
+  # NOTE on picking the column at a 20-day horizon: res_rq_cntrb (CNTR = the RQ
+  # *trading*, short-horizon model) is the house evaluation default but is only
+  # materialised out to _10d. At 15d/20d/30d/40d the family on disk is
+  # res_rq_cnltb (CNLT = *long-term*), which also matches a 20-day holding
+  # period better. Hence the default above.
+  forward_label_path: null
+  forward_label_column: null
+  forward_label_scale: 1.0
+
+  # Fallback: compute the forward return from closes and residualise it against
+  # exposures you supply — a parquet keyed by (date, stable_id) whose remaining
+  # columns are industry dummies, log market cap, etc. Mutually exclusive with
+  # forward_label_path. With neither, the label is only cross-sectionally
+  # standardised — a real deviation from the report. See README.md.
+  exposures_path: null
+  exposure_columns: null
+
+  clip_sigma: null             # e.g. 5.0 to winsorise the label
+
+train:
+  first_predict_year: 2018
+  last_predict_year: 2024
+  lookback_years: 4            # section 3.2: 4 years back per fit
+  validation_years: 1          # the last of them is validation
+  drop_last_month: true        # "剔除末月", so the 20-day label cannot cross the split
+  max_epochs: 100
+  early_stopping_patience: 30
+  accumulate_grad_batches: 1
+  num_workers: 4
+  seed: 20240603
+  precision: 32
+  output_dir: runs/default

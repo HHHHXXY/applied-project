@@ -1,0 +1,132 @@
+# The report's own setting, as closely as this data allows.
+#
+# Differences from configs/default.yaml are all in the direction of fidelity and
+# cost: full market instead of a liquidity screen, every trading day instead of
+# every fifth, and the report's exact industry + market-cap neutralised target
+# rather than a plain forward return.
+#
+# ---------------------------------------------------------------------------
+# ONE THING CANNOT BE MATCHED: the first two prediction years.
+#
+# The report rolls yearly from 2018 with a 4-year lookback, so its 2018 fit
+# trains on 2014-2016 and validates on 2017. Five-minute bars in this data lake
+# begin 2016-01-04, and after the 60-trading-day warmup the first usable sample
+# is 2016-04-01. There is no 2014 or 2015 intraday history anywhere to fall back
+# on, so the 2018 and 2019 fits are simply not constructible.
+#
+#   predict 2018   train 2014-2016  val 2017   IMPOSSIBLE (no 2014-2015 data)
+#   predict 2019   train 2015-2017  val 2018   IMPOSSIBLE (no 2015 data)
+#   predict 2020   train 2016-2018  val 2019   partial: 2016 starts in April
+#   predict 2021   train 2017-2019  val 2020   fully clean
+#
+# first_predict_year is set to 2020 below: its training set loses Q1 2016, about
+# 8% of the three training years, which is a far smaller compromise than
+# dropping the year. Set it to 2021 if you want every fit strictly clean.
+#
+# Compare against the report's PER-YEAR tables 12 and 13, not its headline
+# aggregate — the aggregate covers 2018-01..2024-05 and yours will not.
+# ---------------------------------------------------------------------------
+
+data:
+  daily_path: /tq/scratch/zhangchang/data/cn_equity/pv/daily_ohlcv_20160101_20251231.parquet
+  intraday_path: /tq/scratch/zhangchang/data/cn_equity/pv/intraday/rq_5m_ohlcv_20160101_20251231.parquet
+  cache_dir: /data/gsm/cache_paper
+
+  start_date: "2016-01-01"     # clamped to the first date with a full warmup
+  end_date: "2024-05-31"       # the report's factor period ends 2024-05
+
+  minute_lookback_days: 20     # section 3.2
+  daily_lookback_days: 60      # section 3.2
+
+  train_day_stride: 1          # the report samples every trading day
+  predict_day_stride: 1
+
+  universe_top_n: null         # 全市场. Table 14 shows the factor is strongest in
+  universe_lookback_days: 60   # small caps, so a liquidity screen would understate it.
+
+  min_valid_fraction: 0.5
+  price_zscore: joint
+  use_minute_branch: true
+  use_daily_branch: true
+
+  # GPU training reads a day-batch in milliseconds, so per-batch disk reads would
+  # starve the device. Hold each split in RAM instead: at full market a 4-year
+  # training split is ~27 GB in float32, so the box needs ~48 GB of RAM. Drop
+  # preload_max_gb below that to fall back to per-batch reads on a smaller box.
+  #
+  # feature_dtype stays float32. float16 would halve this, but depth-5
+  # log-signatures reach ~264,000 and float16 overflows at 65,504 — the build
+  # refuses the cast rather than write silent infinities.
+  feature_dtype: float32
+  preload: auto
+  preload_max_gb: 32.0
+
+minute_gsm: &gsm
+  depth: 5                     # section 3.1: truncation 5
+  augmentations: [coordinate_projection, time, basepoint]
+  transform: logsignature
+  window: global
+  rescaling: none
+  projection_size: 2
+  projection_ordered: false
+  backend: auto
+
+daily_gsm: *gsm
+
+model:
+  hidden_dim: 128
+  n_attention_heads: 4
+  attention_dropout: 0.1
+  use_stock_mixing: true
+  learning_rate: 0.001
+  weight_decay: 0.00001
+  loss_halflife_fraction: 0.5  # section 3.2: half-life = batch size / 2
+
+  # THE ONE DELIBERATE DEVIATION FROM THE REPORT, and it is not optional.
+  #
+  # The report rescales nothing (its section 2.5 rho stage; its table 7 finds
+  # "none" best), so the network's first op is a Linear over raw depth-5
+  # log-signature channels. On this data that does not train at all: measured
+  # over the cache, a branch's largest absolute value is ~4900 while its 99th
+  # percentile is ~10, and both fp32 and fp16 drove the validation rank IC to a
+  # non-finite value inside the first epoch. It was not a precision problem —
+  # fp32 died faster than fp16.
+  #
+  # gauss_rank ranks each feature across the day's cross section and maps it
+  # through the inverse normal CDF. It is same-date only, so no lookahead, and
+  # it costs the model any notion of magnitude beyond order. With it, the same
+  # eight epochs give train/loss -0.079 -> -0.177 and a stable val rank IC of
+  # 0.10-0.125 instead of NaN. Set to "none" to reproduce the failure.
+  input_transform: gauss_rank
+
+labels:
+  horizon: 20                  # section 3.2: future 20-day return
+  # The report's exact target: industry and market-cap neutralised, then
+  # cross-sectionally standardised. Generate with
+  #   python scripts/export_exposures.py --out /data/gsm/exposures.parquet
+  exposures_path: /data/gsm/exposures.parquet
+  exposure_columns: null       # all of them: log_mktcap + 29 CITICS dummies
+  clip_sigma: null
+
+train:
+  first_predict_year: 2020     # see the note above; 2018/2019 are not constructible
+  last_predict_year: 2024
+  lookback_years: 4            # section 3.2
+  validation_years: 1
+  drop_last_month: true        # "剔除末月"
+  max_epochs: 100              # section 3.2
+  early_stopping_patience: 30  # section 3.2
+  accumulate_grad_batches: 1
+  num_workers: 8              # ignored once a split is preloaded
+  seed: 20240603
+
+  # Train on the GPU. The cache build stays on CPU (it is signature-bound and
+  # needs signatory); this stage only reads the cached features, so the training
+  # box needs no signatory at all. precision 16 matters here because the
+  # stock-mixing attention is O(stocks^2) and dominates at full market.
+  accelerator: auto           # "gpu" to fail loudly if no card is visible
+  devices: auto
+  precision: 16               # set 32 on CPU — AMP only helps on a GPU
+  torch_threads: 0            # set explicitly when training on CPU
+
+  output_dir: runs/paper
